@@ -28,6 +28,11 @@ impl Handler for Ping {
                 .as_secs(),
         })
     }
+
+    const CAN_HANDLE_DEFAULT: bool = true;
+    fn build_from_default() -> Self {
+        Self {}
+    }
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]

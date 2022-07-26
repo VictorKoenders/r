@@ -25,4 +25,13 @@ pub enum Error {
     Deserialize { source: serde_json::Error },
 }
 
+impl serde::Serialize for Error {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        format!("{:?}", self).serialize(serializer)
+    }
+}
+
 pub type Result<T = ()> = std::result::Result<T, Error>;

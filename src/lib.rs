@@ -10,20 +10,37 @@ use futures::{
     future::Either,
     SinkExt,
 };
+use itertools::free::join;
+use std::str::FromStr;
 use std::{collections::HashMap, time::Instant};
+use unicase::UniCase;
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct HandleKey(&'static str);
+#[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+struct HandleKey(UniCase<String>);
 
-impl std::borrow::Borrow<str> for HandleKey {
-    fn borrow(&self) -> &str {
-        self.0
+impl HandleKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::borrow::Borrow<UniCase<String>> for HandleKey {
+    fn borrow(&self) -> &UniCase<String> {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for HandleKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_str().fmt(f)
     }
 }
 
 impl From<&'static str> for HandleKey {
     fn from(inner: &'static str) -> Self {
-        Self(inner)
+        let key = join(inner.split("::").skip(1), ".");
+        println!("Key = {:?}", key);
+        Self(UniCase::new(key))
     }
 }
 
@@ -51,20 +68,29 @@ impl System {
         while let Some(message) = stream.next().await {
             match message {
                 Either::Left(IncomingMessage { address, message }) => {
-                    let Tagged {
+                    // try to parse the incoming tag as JSON
+                    let (id, tag, value) = if let Ok(Tagged {
                         id,
                         tag,
                         value,
                         error: _,
-                    } = match serde_json::from_str(&message) {
-                        Ok(tagged) => tagged,
-                        Err(e) => {
-                            println!("Could not deserialize message: {:?}", e);
-                            println!("{}", message);
-                            return;
-                        }
+                    }) = serde_json::from_str(&message)
+                    {
+                        (id, tag, value)
+                        // else parse e.g. "temp.record;12.34"
+                    } else if let Some((tag, remaining)) = message.split_once(';') {
+                        let value: serde_json::Value = if let Ok(val) = f64::from_str(remaining) {
+                            val.into()
+                        } else {
+                            serde_json::Value::String(remaining.to_owned())
+                        };
+                        (String::new(), tag.to_owned(), value)
+                        // else assume the entire message is a tag, e.g. "Ping"
+                    } else {
+                        (String::new(), message, serde_json::Value::Null)
                     };
-                    let handle = self.handles.get(tag.as_str());
+
+                    let handle = self.handles.get(&UniCase::new(tag.clone()));
                     async_std::task::spawn({
                         let mut sender = self.task_finished_sender.clone();
                         let handle = handle.cloned();
@@ -72,23 +98,15 @@ impl System {
                             let start = Instant::now();
                             let mut ctx = HandleContext::new(id);
                             if let Some(handle) = handle {
-                                if let Err(e) = (handle.invoke)(&mut ctx, value).await {
-                                    eprintln!("Could not handle {}", handle.tag);
-                                    eprintln!("{:?}", e);
-                                } else {
-                                    println!(
-                                        "Executed task {} in {:?}",
-                                        handle.tag,
-                                        start.elapsed()
-                                    );
+                                if let Err(e) = spawn_handle(handle, value, &mut ctx).await {
+                                    ctx.respond_with_error(e).await;
                                 }
                             } else {
-                                ctx.respond_with_error("No valid handler found").await;
-                            };
-                            sender
-                                .send((address, ctx))
-                                .await
-                                .expect("Could not report task being finished");
+                                ctx.respond_with_error(format!("Handler {:?} not found", tag))
+                                    .await;
+                            }
+                            println!("{:?} done {:?}", tag, start.elapsed());
+                            let _ = sender.send((address, ctx)).await;
                         }
                     });
                 }
@@ -101,6 +119,24 @@ impl System {
                 }
             }
         }
+    }
+}
+
+async fn spawn_handle(
+    handle: HandleWrapper,
+    value: serde_json::Value,
+    ctx: &mut HandleContext,
+) -> Result<()> {
+    if value.is_null() && handle.can_handle_default {
+        (handle.invoke)(ctx, InputTy::Default).await
+    } else if handle.can_handle_f64 && value.is_f64() {
+        if let Some(val) = value.as_f64() {
+            (handle.invoke)(ctx, InputTy::F64(val)).await
+        } else {
+            unreachable!()
+        }
+    } else {
+        (handle.invoke)(ctx, InputTy::Json(value)).await
     }
 }
 
