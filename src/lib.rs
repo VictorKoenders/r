@@ -15,6 +15,24 @@ use std::str::FromStr;
 use std::{collections::HashMap, time::Instant};
 use unicase::UniCase;
 
+pub mod prelude {
+    pub use crate::{HandleContext, Handler};
+    pub use async_trait::async_trait;
+    pub use serde;
+
+    pub struct SerializeAsDebugString<T: std::fmt::Debug>(pub T);
+
+    impl<T: std::fmt::Debug> serde::Serialize for SerializeAsDebugString<T> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let str = format!("{:?}", self.0);
+            str.serialize(serializer)
+        }
+    }
+}
+
 #[derive(Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
 struct HandleKey(UniCase<String>);
 
@@ -39,24 +57,36 @@ impl std::fmt::Debug for HandleKey {
 impl From<&'static str> for HandleKey {
     fn from(inner: &'static str) -> Self {
         let key = join(inner.split("::").skip(1), ".");
-        println!("Key = {:?}", key);
         Self(UniCase::new(key))
     }
 }
 
-pub struct System {
+pub struct System<STATE: Clone + Send + 'static> {
     endpoints: Vec<Box<dyn Endpoint>>,
-    handles: HashMap<HandleKey, HandleWrapper>,
+    handles: HashMap<HandleKey, HandleWrapper<STATE>>,
     receiver_incoming_message: Receiver<IncomingMessage>,
     task_finished_receiver: Receiver<(EndpointAddr, HandleContext)>,
     task_finished_sender: Sender<(EndpointAddr, HandleContext)>,
+    state: STATE,
 }
 
-impl System {
-    pub fn builder() -> SystemBuilder {
+impl System<()> {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> SystemBuilder<()> {
         SystemBuilder {
             endpoint_builders: Vec::new(),
             handles: HashMap::new(),
+            state: (),
+        }
+    }
+}
+
+impl<STATE: Clone + Send + 'static> System<STATE> {
+    pub fn with_state(state: STATE) -> SystemBuilder<STATE> {
+        SystemBuilder {
+            endpoint_builders: Vec::new(),
+            handles: HashMap::new(),
+            state,
         }
     }
 
@@ -94,16 +124,16 @@ impl System {
                     async_std::task::spawn({
                         let mut sender = self.task_finished_sender.clone();
                         let handle = handle.cloned();
+                        let state = self.state.clone();
                         async move {
                             let start = Instant::now();
                             let mut ctx = HandleContext::new(id);
                             if let Some(handle) = handle {
-                                if let Err(e) = spawn_handle(handle, value, &mut ctx).await {
-                                    ctx.respond_with_error(e).await;
+                                if let Err(e) = spawn_handle(handle, state, value, &mut ctx).await {
+                                    ctx.error(e);
                                 }
                             } else {
-                                ctx.respond_with_error(format!("Handler {:?} not found", tag))
-                                    .await;
+                                ctx.error_string(format!("Handler {:?} not found", tag));
                             }
                             println!("{:?} done {:?}", tag, start.elapsed());
                             let _ = sender.send((address, ctx)).await;
@@ -122,22 +152,30 @@ impl System {
     }
 }
 
-async fn spawn_handle(
-    handle: HandleWrapper,
+async fn spawn_handle<STATE>(
+    handle: HandleWrapper<STATE>,
+    state: STATE,
     value: serde_json::Value,
     ctx: &mut HandleContext,
 ) -> Result<()> {
-    if value.is_null() && handle.can_handle_default {
-        (handle.invoke)(ctx, InputTy::Default).await
+    let input_ty = if value.is_null() && handle.can_handle_default {
+        InputTy::Default
     } else if handle.can_handle_f64 && value.is_f64() {
         if let Some(val) = value.as_f64() {
-            (handle.invoke)(ctx, InputTy::F64(val)).await
+            InputTy::F64(val)
+        } else {
+            unreachable!()
+        }
+    } else if handle.can_handle_string && value.is_string() {
+        if let Some(val) = value.as_str() {
+            InputTy::String(val.to_owned())
         } else {
             unreachable!()
         }
     } else {
-        (handle.invoke)(ctx, InputTy::Json(value)).await
-    }
+        InputTy::Json(value)
+    };
+    (handle.invoke)(state, ctx, input_ty).await
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -151,25 +189,33 @@ struct Tagged {
     pub error: serde_json::Value,
 }
 
-pub struct SystemBuilder {
+pub struct SystemBuilder<STATE> {
     endpoint_builders: Vec<Box<dyn EndpointBuilder>>,
-    handles: HashMap<HandleKey, HandleWrapper>,
+    handles: HashMap<HandleKey, HandleWrapper<STATE>>,
+    state: STATE,
 }
 
-impl SystemBuilder {
-    pub async fn build(self) -> Result<System> {
+impl<STATE: Clone + Send + 'static> SystemBuilder<STATE> {
+    pub async fn build(self) -> Result<System<STATE>> {
+        let SystemBuilder {
+            endpoint_builders,
+            handles,
+            state,
+        } = self;
+
         let (sender_incoming_message, receiver_incoming_message) = channel(1024);
-        let mut endpoints = Vec::with_capacity(self.endpoint_builders.len());
-        for mut builder in self.endpoint_builders {
+        let mut endpoints = Vec::with_capacity(endpoint_builders.len());
+        for mut builder in endpoint_builders {
             endpoints.push(builder.build(sender_incoming_message.clone()).await?);
         }
         let (task_finished_sender, task_finished_receiver) = channel(1024);
         Ok(System {
             endpoints,
-            handles: self.handles,
+            handles,
             receiver_incoming_message,
             task_finished_receiver,
             task_finished_sender,
+            state,
         })
     }
 }

@@ -3,7 +3,7 @@ mod endpoints;
 pub use self::endpoints::{Endpoint, EndpointAddr, EndpointBuilder, IncomingMessage};
 use async_std::net::ToSocketAddrs;
 
-impl crate::SystemBuilder {
+impl<STATE> crate::SystemBuilder<STATE> {
     pub fn accept_tcp<T>(mut self, addr: T) -> Self
     where
         T: ToSocketAddrs + Send + 'static,

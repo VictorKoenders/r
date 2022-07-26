@@ -1,9 +1,8 @@
-use async_trait::async_trait;
-use r::{HandleContext, Handler};
+use r::prelude::*;
 
 #[async_std::main]
 async fn main() {
-    let system = r::System::builder()
+    let system = r::System::new()
         .accept_tcp("0.0.0.0:1234")
         .handle::<Ping>()
         .build()
@@ -18,15 +17,15 @@ struct Ping {}
 
 #[async_trait]
 impl Handler for Ping {
-    type Output = Pong;
     type Error = ();
-    async fn handle(mut self, _ctx: &mut HandleContext) -> Result<Pong, ()> {
-        Ok(Pong {
+    async fn handle(mut self, _state: (), ctx: &mut HandleContext) -> Result<(), ()> {
+        ctx.reply(Pong {
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-        })
+        });
+        Ok(())
     }
 
     const CAN_HANDLE_DEFAULT: bool = true;
